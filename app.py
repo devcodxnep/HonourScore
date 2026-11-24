@@ -4,6 +4,7 @@ import sys
 import json
 import time
 import base64
+import struct
 import threading
 from collections import deque
 
@@ -488,6 +489,143 @@ def fetch_credit_score(region: str, target_account_id: int) -> int:
 
 
 # ==========================================
+# TC Stats (Pure-Python Protobuf -> JSON)
+# ==========================================
+def build_tc_stats_req(account_id: int, season_id: int = 0, game_mode: int = 15, match_mode: int = 6) -> bytes:
+    payload = bytearray()
+    payload += encode_pb_varint_field(1, account_id)
+    payload += encode_pb_varint_field(2, season_id)
+    payload += encode_pb_varint_field(3, game_mode)
+    payload += encode_pb_varint_field(4, match_mode)
+    return bytes(payload)
+
+
+def parse_detailed_tc_stats(raw_proto: bytes) -> dict:
+    field_map = {
+        1: "mvp_count",
+        2: "double_kills",
+        3: "triple_kills",
+        4: "four_kills",
+        5: "damage",
+        6: "head_shot_kills",
+        7: "knock_downs",
+        8: "revivals",
+        9: "assists",
+        10: "deaths",
+        11: "streak_wins",
+        12: "throwing_kills",
+        13: "one_game_most_damage",
+        14: "one_game_most_kills",
+        16: "rating_enabled_games",
+        17: "headshot_count",
+        18: "hit_count",
+        19: "gold_medal_cnt",
+        20: "silver_medal_cnt",
+    }
+    stats = {}
+    pos = 0
+    while pos < len(raw_proto):
+        tag, pos = decode_varint(raw_proto, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+
+        if field_num == 15 and wire_type == 1:
+            stats["rating_points"] = struct.unpack("<d", raw_proto[pos:pos + 8])[0]
+            pos += 8
+        elif field_num in field_map and wire_type == 0:
+            val, pos = decode_varint(raw_proto, pos)
+            stats[field_map[field_num]] = val
+        else:
+            pos = skip_field(raw_proto, pos, wire_type)
+    return stats
+
+
+def parse_account_tc_stats(raw_proto: bytes) -> dict:
+    field_map = {
+        1: "account_id",
+        2: "games_played",
+        3: "wins",
+        4: "kills",
+    }
+    result = {}
+    pos = 0
+    while pos < len(raw_proto):
+        tag, pos = decode_varint(raw_proto, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+
+        if field_num in field_map and wire_type == 0:
+            val, pos = decode_varint(raw_proto, pos)
+            result[field_map[field_num]] = val
+        elif field_num == 5 and wire_type == 2:
+            length, pos = decode_varint(raw_proto, pos)
+            result["detailed_stats"] = parse_detailed_tc_stats(raw_proto[pos:pos + length])
+            pos += length
+        else:
+            pos = skip_field(raw_proto, pos, wire_type)
+    return result
+
+
+def parse_tc_stats_res(raw_proto: bytes) -> dict:
+    result = {}
+    pos = 0
+    while pos < len(raw_proto):
+        tag, pos = decode_varint(raw_proto, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+
+        if field_num == 1 and wire_type == 2:
+            length, pos = decode_varint(raw_proto, pos)
+            result["cs_stats"] = parse_account_tc_stats(raw_proto[pos:pos + length])
+            pos += length
+        else:
+            pos = skip_field(raw_proto, pos, wire_type)
+    return result
+
+
+def fetch_tc_stats(region: str, target_account_id: int, season_id: int = 0, game_mode: int = 15, match_mode: int = 6) -> dict:
+    url = f"{get_url_by_region(region)}/GetPlayerTCStats"
+    encrypted_body = encrypt_payload(
+        build_tc_stats_req(target_account_id, season_id, game_mode, match_mode)
+    )
+    pool_key = get_pool_key(region)
+    max_attempts = len(GUEST_ACCOUNTS[pool_key])
+
+    start_index = 0
+    force_refresh = False
+
+    for attempt in range(max_attempts):
+        token, used_idx = get_jwt_token(region, start_index=start_index, force_refresh=force_refresh)
+
+        headers = {
+            "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+            "Accept": "*/*",
+            "Accept-Encoding": "deflate, gzip",
+            "X-GA-SV": str(int(time.time())),
+            "Authorization": f"Bearer {token}",
+            "X-GA": "v1 1",
+            "ReleaseVersion": OB_VERSION,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2018.4.12f1",
+        }
+
+        resp = requests.post(url, headers=headers, data=encrypted_body, timeout=15)
+
+        if resp.status_code in (401, 403) and attempt < max_attempts - 1:
+            start_index = (used_idx + 1) % max_attempts
+            force_refresh = True
+            continue
+
+        resp.raise_for_status()
+        parsed = parse_tc_stats_res(resp.content)
+        if not parsed:
+            raise ValueError("TC stats not found in server response.")
+        return parsed
+
+    raise RuntimeError("Unable to retrieve TC stats after trying all guest accounts.")
+
+
+# ==========================================
 # Web UI & API Routes
 # ==========================================
 HTML_PAGE = """<!DOCTYPE html>
@@ -784,67 +922,231 @@ HTML_PAGE = """<!DOCTYPE html>
       font-size: 0.88rem;
       padding: 18px 0;
     }
+
+    .tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 6px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+    }
+
+    .tab-btn {
+      height: 40px;
+      border: none;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+
+    .tab-btn.active {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff;
+    }
+
+    .tab-panel { display: none; }
+    .tab-panel.active { display: flex; flex-direction: column; gap: 18px; }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    @media (max-width: 480px) {
+      .stats-grid { grid-template-columns: 1fr; }
+    }
+
+    .json-box {
+      margin-top: 18px;
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid var(--border);
+      display: none;
+      animation: fadeUp 0.25s ease forwards;
+    }
+
+    .json-box.visible { display: block; }
+
+    .json-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .json-header span {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .copy-btn {
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text);
+      font-size: 0.78rem;
+      padding: 4px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+
+    .json-pre {
+      max-height: 340px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      color: #7dd3fc;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
   <main class="container">
-    <section class="card">
-      <div class="header">
-        <h1>Credit Score Checker</h1>
-        <p>Select region and enter Account ID</p>
-      </div>
+    <div class="tabs">
+      <button type="button" class="tab-btn active" data-tab="creditTab">Credit Score</button>
+      <button type="button" class="tab-btn" data-tab="statsTab">TC Stats Viewer</button>
+    </div>
 
-      <form id="checkForm">
-        <div class="form-grid">
-          <div class="field">
-            <label for="region">Region</label>
-            <select id="region" name="region">
-              <option value="BD" selected>BD</option>
-              <option value="IND">IND</option>
-              <option value="SG">SG</option>
-              <option value="SAC">SAC</option>
-              <option value="BR">BR</option>
-              <option value="US">US</option>
-              <option value="NA">NA</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="accountId">Account ID (UID)</label>
-            <input
-              id="accountId"
-              name="account_id"
-              type="text"
-              inputmode="numeric"
-              pattern="[0-9]+"
-              placeholder="e.g. 18626997545"
-              required
-            />
-          </div>
+    <div id="creditTab" class="tab-panel active">
+      <section class="card">
+        <div class="header">
+          <h1>Credit Score Checker</h1>
+          <p>Select region and enter Account ID</p>
         </div>
 
-        <button type="submit" class="btn" id="submitBtn">
-          <span class="spinner"></span>
-          <span id="btnText">Check Credit Score</span>
-        </button>
-      </form>
+        <form id="checkForm">
+          <div class="form-grid">
+            <div class="field">
+              <label for="region">Region</label>
+              <select id="region" name="region">
+                <option value="BD" selected>BD</option>
+                <option value="IND">IND</option>
+                <option value="SG">SG</option>
+                <option value="SAC">SAC</option>
+                <option value="BR">BR</option>
+                <option value="US">US</option>
+                <option value="NA">NA</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="accountId">Account ID (UID)</label>
+              <input
+                id="accountId"
+                name="account_id"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]+"
+                placeholder="e.g. 18626997545"
+                required
+              />
+            </div>
+          </div>
 
-      <div id="errorBox" class="error-msg"></div>
+          <button type="submit" class="btn" id="submitBtn">
+            <span class="spinner"></span>
+            <span id="btnText">Check Credit Score</span>
+          </button>
+        </form>
 
-      <div id="resultBox" class="result-box">
-        <div class="score-label">Credit Score</div>
-        <div id="scoreValue" class="score-value">--</div>
-      </div>
-    </section>
+        <div id="errorBox" class="error-msg"></div>
 
-    <section class="card">
-      <div class="history-header">
-        <h2>Last 10 Checks</h2>
-        <span class="history-count" id="historyCount">0 / 10</span>
-      </div>
-      <div id="historyContainer">
-        <div class="empty-history">No checks yet.</div>
-      </div>
-    </section>
+        <div id="resultBox" class="result-box">
+          <div class="score-label">Credit Score</div>
+          <div id="scoreValue" class="score-value">--</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="history-header">
+          <h2>Last 10 Checks</h2>
+          <span class="history-count" id="historyCount">0 / 10</span>
+        </div>
+        <div id="historyContainer">
+          <div class="empty-history">No checks yet.</div>
+        </div>
+      </section>
+    </div>
+
+    <div id="statsTab" class="tab-panel">
+      <section class="card">
+        <div class="header">
+          <h1>TC Stats Viewer</h1>
+          <p>Fetch player TC stats in JSON</p>
+        </div>
+
+        <form id="statsForm">
+          <div class="form-grid">
+            <div class="field">
+              <label for="statsRegion">Region</label>
+              <select id="statsRegion" name="region">
+                <option value="BD" selected>BD</option>
+                <option value="IND">IND</option>
+                <option value="SG">SG</option>
+                <option value="SAC">SAC</option>
+                <option value="BR">BR</option>
+                <option value="US">US</option>
+                <option value="NA">NA</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="statsAccountId">Account ID (UID)</label>
+              <input
+                id="statsAccountId"
+                name="account_id"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]+"
+                placeholder="e.g. 3203014668"
+                required
+              />
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            <div class="field">
+              <label for="seasonId">Season ID</label>
+              <input id="seasonId" type="number" min="0" value="0" required />
+            </div>
+            <div class="field">
+              <label for="gameMode">Game Mode</label>
+              <input id="gameMode" type="number" min="0" value="15" required />
+            </div>
+            <div class="field">
+              <label for="matchMode">Match Mode</label>
+              <input id="matchMode" type="number" min="0" value="6" required />
+            </div>
+          </div>
+
+          <button type="submit" class="btn" id="statsSubmitBtn">
+            <span class="spinner"></span>
+            <span id="statsBtnText">Get TC Stats (JSON)</span>
+          </button>
+        </form>
+
+        <div id="statsErrorBox" class="error-msg"></div>
+
+        <div id="statsJsonBox" class="json-box">
+          <div class="json-header">
+            <span>JSON Response</span>
+            <button type="button" class="copy-btn" id="copyJsonBtn">Copy JSON</button>
+          </div>
+          <pre id="statsJsonPre" class="json-pre"></pre>
+        </div>
+      </section>
+    </div>
   </main>
 
   <script>
@@ -974,6 +1276,75 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     });
 
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById(btn.dataset.tab).classList.add("active");
+      });
+    });
+
+    const statsForm = document.getElementById("statsForm");
+    const statsSubmitBtn = document.getElementById("statsSubmitBtn");
+    const statsBtnText = document.getElementById("statsBtnText");
+    const statsErrorBox = document.getElementById("statsErrorBox");
+    const statsJsonBox = document.getElementById("statsJsonBox");
+    const statsJsonPre = document.getElementById("statsJsonPre");
+    const copyJsonBtn = document.getElementById("copyJsonBtn");
+
+    statsForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const region = document.getElementById("statsRegion").value;
+      const accountId = document.getElementById("statsAccountId").value.trim();
+      const seasonId = Number(document.getElementById("seasonId").value || 0);
+      const gameMode = Number(document.getElementById("gameMode").value || 15);
+      const matchMode = Number(document.getElementById("matchMode").value || 6);
+
+      statsErrorBox.classList.remove("visible");
+      statsJsonBox.classList.remove("visible");
+      statsSubmitBtn.classList.add("loading");
+      statsSubmitBtn.disabled = true;
+      statsBtnText.textContent = "Fetching...";
+
+      try {
+        const res = await fetch("/api/tc-stats", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            region,
+            account_id: accountId,
+            season_id: seasonId,
+            game_mode: gameMode,
+            match_mode: matchMode
+          })
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Request failed");
+        }
+
+        statsJsonPre.textContent = JSON.stringify(data, null, 2);
+        statsJsonBox.classList.add("visible");
+      } catch (err) {
+        statsErrorBox.textContent = err.message;
+        statsErrorBox.classList.add("visible");
+      } finally {
+        statsSubmitBtn.classList.remove("loading");
+        statsSubmitBtn.disabled = false;
+        statsBtnText.textContent = "Get TC Stats (JSON)";
+      }
+    });
+
+    copyJsonBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(statsJsonPre.textContent);
+        copyJsonBtn.textContent = "Copied!";
+        setTimeout(() => { copyJsonBtn.textContent = "Copy JSON"; }, 1200);
+      } catch (_) {}
+    });
+
     loadHistory();
   </script>
 </body>
@@ -1019,6 +1390,30 @@ def api_check():
         "credit_score": score,
         "history": history_snapshot,
     })
+
+
+@app.route("/api/tc-stats", methods=["POST"])
+def api_tc_stats():
+    data = request.get_json(silent=True) or {}
+    region = str(data.get("region", "BD")).strip().upper() or "BD"
+    raw_uid = str(data.get("account_id", "")).strip()
+
+    if not raw_uid.isdigit():
+        return jsonify({"error": "Please enter a valid numeric Account ID."}), 400
+
+    try:
+        season_id = int(data.get("season_id", 0))
+        game_mode = int(data.get("game_mode", 15))
+        match_mode = int(data.get("match_mode", 6))
+    except (TypeError, ValueError):
+        return jsonify({"error": "season_id, game_mode, and match_mode must be integers."}), 400
+
+    try:
+        stats_json = fetch_tc_stats(region, int(raw_uid), season_id, game_mode, match_mode)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    return jsonify(stats_json)
 
 
 if __name__ == "__main__":
