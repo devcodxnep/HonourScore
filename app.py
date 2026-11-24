@@ -17,9 +17,6 @@ from flask import Flask, request, jsonify, render_template_string
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-import MajoRLoGinrEq_pb2
-import MajorLoginRes_pb2
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -248,81 +245,108 @@ def extract_credit_score(raw_proto: bytes):
 # ==========================================
 # Guest OAuth -> MajorLogin -> JWT
 # ==========================================
+def encode_pb_varint_field(field_num: int, value: int) -> bytes:
+    if value == 0:
+        return b""
+    tag = encode_varint((field_num << 3) | 0)
+    return tag + encode_varint(value)
+
+
+def encode_pb_bytes_field(field_num: int, value: bytes) -> bytes:
+    if not value:
+        return b""
+    tag = encode_varint((field_num << 3) | 2)
+    return tag + encode_varint(len(value)) + value
+
+
+def encode_pb_str_field(field_num: int, value: str) -> bytes:
+    if not value:
+        return b""
+    return encode_pb_bytes_field(field_num, value.encode("utf-8"))
+
+
+def extract_login_token(raw_proto: bytes):
+    pos = 0
+    while pos < len(raw_proto):
+        tag, pos = decode_varint(raw_proto, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+
+        if field_num == 8 and wire_type == 2:
+            length, pos = decode_varint(raw_proto, pos)
+            if pos + length > len(raw_proto):
+                return None
+            token = raw_proto[pos:pos + length].decode("utf-8")
+            return token if token.count(".") == 2 else None
+        else:
+            pos = skip_field(raw_proto, pos, wire_type)
+    return None
+
+
 def build_major_login_payload(open_id: str, access_token: str, country_code: str) -> bytes:
-    major_login = MajoRLoGinrEq_pb2.MajorLogin()
-
-    major_login.open_id = open_id
-    major_login.access_token = access_token
-    major_login.client_version = VERSION
-
-    major_login.event_time = "2026-09-16 10:32:36"
-    major_login.game_name = "free fire"
-    major_login.platform_id = 1
-    major_login.system_software = "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)"
-    major_login.system_hardware = "Handheld"
-    major_login.telecom_operator = "Ncell"
-    major_login.network_type = "WIFI"
-    major_login.screen_width = 1600
-    major_login.screen_height = 720
-    major_login.screen_dpi = "320"
-    major_login.processor_details = "ARMv7 VFPv3 NEON | 2001 | 8"
-    major_login.memory = 3790
-    major_login.gpu_renderer = "PowerVR Rogue GE8320"
-    major_login.gpu_version = "OpenGL ES 3.2 build 1.11@5425693"
-    major_login.unique_device_id = "Google|00000000-0000-0000-0000-000000000000"
-    major_login.client_ip = "111.119.38.133"
-    major_login.language = "en"
-    major_login.open_id_type = "4"
-    major_login.device_type = "Handheld"
-
-    major_login.device_model = "Xiaomi M2006C3LII"
-    major_login.country_code = country_code
-
-    major_login.platform_sdk_id = 1
-    major_login.network_operator_a = "Ncell"
-    major_login.network_type_a = "WIFI"
-    major_login.client_using_version = "1ac4b80ecf0478a44203bf8fac6120f5"
-
-    major_login.external_storage_total = 53041
-    major_login.external_storage_available = 7291
-    major_login.internal_storage_total = 2176
-    major_login.game_disk_storage_available = 7395
-    major_login.game_disk_storage_total = 53041
-    major_login.external_sdcard_avail_storage = 7395
-    major_login.external_sdcard_total_storage = 53041
-
-    major_login.field_70 = 4
-    major_login.login_by = 2
-    major_login.library_path = "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm"
-    major_login.reg_avatar = 1
-    major_login.library_token = "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk"
-    major_login.channel_type = 6
-    major_login.cpu_type = 1
-    major_login.cpu_architecture = "32"
-    major_login.client_version_code = "2019121227"
-
-    major_login.field_85 = 3
-    major_login.graphics_api = "OpenGLES2"
-    major_login.supported_astc_bitset = 3071
-    major_login.login_open_id_type = 4
-    major_login.loading_time = 9329
-    major_login.release_channel = "3rd_party"
-    major_login.extra_info = "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug="
-    major_login.android_engine_init_flag = 111207
-
-    major_login.field_96 = json.dumps({"cur_rate": None, "support_etc2": False}, separators=(",", ":"))
-
-    major_login.if_push = 1
-    major_login.origin_platform_type = "4"
-    major_login.primary_platform_type = "4"
-
-    major_login.field_102 = bytes.fromhex("42 54 4c 10 53 0e 5b 04 30")
-    major_login.field_104 = 47591
-    major_login.field_105 = 1
-    major_login.field_106 = "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b"
-    major_login.field_107 = "c8e41b7a93f02d56e1a94c7b8203f5d1"
-
-    return encrypt_payload(major_login.SerializeToString())
+    payload = bytearray()
+    payload += encode_pb_str_field(3, "2026-09-16 10:32:36")
+    payload += encode_pb_str_field(4, "free fire")
+    payload += encode_pb_varint_field(5, 1)
+    payload += encode_pb_str_field(7, VERSION)
+    payload += encode_pb_str_field(8, "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)")
+    payload += encode_pb_str_field(9, "Handheld")
+    payload += encode_pb_str_field(10, "Ncell")
+    payload += encode_pb_str_field(11, "WIFI")
+    payload += encode_pb_varint_field(12, 1600)
+    payload += encode_pb_varint_field(13, 720)
+    payload += encode_pb_str_field(14, "320")
+    payload += encode_pb_str_field(15, "ARMv7 VFPv3 NEON | 2001 | 8")
+    payload += encode_pb_varint_field(16, 3790)
+    payload += encode_pb_str_field(17, "PowerVR Rogue GE8320")
+    payload += encode_pb_str_field(18, "OpenGL ES 3.2 build 1.11@5425693")
+    payload += encode_pb_str_field(19, "Google|00000000-0000-0000-0000-000000000000")
+    payload += encode_pb_str_field(20, "111.119.38.133")
+    payload += encode_pb_str_field(21, "en")
+    payload += encode_pb_str_field(22, open_id)
+    payload += encode_pb_str_field(23, "4")
+    payload += encode_pb_str_field(24, "Handheld")
+    payload += encode_pb_str_field(25, "Xiaomi M2006C3LII")
+    payload += encode_pb_str_field(26, country_code)
+    payload += encode_pb_str_field(29, access_token)
+    payload += encode_pb_varint_field(30, 1)
+    payload += encode_pb_str_field(41, "Ncell")
+    payload += encode_pb_str_field(42, "WIFI")
+    payload += encode_pb_str_field(57, "1ac4b80ecf0478a44203bf8fac6120f5")
+    payload += encode_pb_varint_field(60, 53041)
+    payload += encode_pb_varint_field(61, 7291)
+    payload += encode_pb_varint_field(62, 2176)
+    payload += encode_pb_varint_field(64, 7395)
+    payload += encode_pb_varint_field(65, 53041)
+    payload += encode_pb_varint_field(66, 7395)
+    payload += encode_pb_varint_field(67, 53041)
+    payload += encode_pb_varint_field(70, 4)
+    payload += encode_pb_varint_field(73, 2)
+    payload += encode_pb_str_field(74, "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm")
+    payload += encode_pb_varint_field(76, 1)
+    payload += encode_pb_str_field(77, "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk")
+    payload += encode_pb_varint_field(78, 6)
+    payload += encode_pb_varint_field(79, 1)
+    payload += encode_pb_str_field(81, "32")
+    payload += encode_pb_str_field(83, "2019121227")
+    payload += encode_pb_varint_field(85, 3)
+    payload += encode_pb_str_field(86, "OpenGLES2")
+    payload += encode_pb_varint_field(87, 3071)
+    payload += encode_pb_varint_field(88, 4)
+    payload += encode_pb_varint_field(92, 9329)
+    payload += encode_pb_str_field(93, "3rd_party")
+    payload += encode_pb_str_field(94, "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug=")
+    payload += encode_pb_varint_field(95, 111207)
+    payload += encode_pb_str_field(96, json.dumps({"cur_rate": None, "support_etc2": False}, separators=(",", ":")))
+    payload += encode_pb_varint_field(97, 1)
+    payload += encode_pb_str_field(99, "4")
+    payload += encode_pb_str_field(100, "4")
+    payload += encode_pb_bytes_field(102, bytes.fromhex("42 54 4c 10 53 0e 5b 04 30"))
+    payload += encode_pb_varint_field(104, 47591)
+    payload += encode_pb_varint_field(105, 1)
+    payload += encode_pb_str_field(106, "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b")
+    payload += encode_pb_str_field(107, "c8e41b7a93f02d56e1a94c7b8203f5d1")
+    return encrypt_payload(bytes(payload))
 
 
 def decode_jwt_exp(token: str) -> int:
@@ -382,11 +406,10 @@ def fetch_jwt_for_account(account: dict, pool_key: str) -> str:
 
             candidates = [resp.content[64:], resp.content] if len(resp.content) > 64 else [resp.content]
             for proto_payload in candidates:
-                res_msg = MajorLoginRes_pb2.MajorLoginRes()
                 try:
-                    res_msg.ParseFromString(proto_payload)
-                    if res_msg.token:
-                        return res_msg.token
+                    token = extract_login_token(proto_payload)
+                    if token:
+                        return token
                 except Exception:
                     continue
         except Exception as exc:
@@ -881,7 +904,32 @@ HTML_PAGE = """<!DOCTYPE html>
       `;
     }
 
+    const HISTORY_KEY = "credit_score_history_v1";
+
+    function getLocalHistory() {
+      try {
+        return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function saveLocalHistory(accountId, score) {
+      const items = getLocalHistory();
+      items.unshift({ account_id: String(accountId), credit_score: score });
+      const trimmed = items.slice(0, 10);
+      try {
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(trimmed));
+      } catch (_) {}
+      return trimmed;
+    }
+
     async function loadHistory() {
+      const localItems = getLocalHistory();
+      if (localItems.length) {
+        renderHistory(localItems);
+        return;
+      }
       try {
         const res = await fetch("/api/history");
         const data = await res.json();
@@ -914,7 +962,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
         resultBox.classList.add("visible");
         animateScore(data.credit_score);
-        renderHistory(data.history || []);
+        const updatedHistory = saveLocalHistory(accountId, data.credit_score);
+        renderHistory(updatedHistory);
       } catch (err) {
         errorBox.textContent = err.message;
         errorBox.classList.add("visible");
